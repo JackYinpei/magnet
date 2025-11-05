@@ -6,6 +6,7 @@ const API_BASE_URL =
 export const API_ROUTES = {
   tasks: `${API_BASE_URL}/api/tasks`,
   storageObjects: `${API_BASE_URL}/api/storage/objects`,
+  storageObjectUrl: `${API_BASE_URL}/api/storage/object-url`,
 };
 
 export async function fetchTasks() {
@@ -66,6 +67,27 @@ export async function fetchObjects(prefix = "") {
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.error ?? "Failed to load objects");
+  }
+  return response.json();
+}
+
+export async function fetchObjectUrl(key, options = {}) {
+  if (!key) {
+    throw new Error("Object key is required");
+  }
+  const url = new URL(API_ROUTES.storageObjectUrl);
+  url.searchParams.set("key", key);
+  if (options.expires) {
+    url.searchParams.set("expires", String(options.expires));
+  }
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error ?? "Failed to resolve object URL");
   }
   return response.json();
 }

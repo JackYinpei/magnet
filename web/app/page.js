@@ -5,6 +5,7 @@ import {
   API_ROUTES,
   createTask,
   deleteTask,
+  fetchObjectUrl,
   fetchObjects,
   fetchTasks,
   resolveApiBaseUrl,
@@ -220,7 +221,7 @@ export default function Home() {
   );
 
   const handlePreviewObject = useCallback(
-    (object) => {
+    async (object) => {
       const key = object?.key ?? "";
       if (!key) {
         showMessage("error", "对象 Key 无效");
@@ -230,17 +231,31 @@ export default function Home() {
         showMessage("info", "当前仅支持 mp4、m4v、mov、webm、ogg 视频文件预览");
         return;
       }
-      const url = buildObjectUrl(key);
+      let url = "";
+      try {
+        const result = await fetchObjectUrl(key);
+        if (result?.url) {
+          url = result.url;
+        }
+      } catch (err) {
+        if (!OBJECT_BASE_URL) {
+          showMessage("error", err.message);
+          return;
+        }
+      }
+      if (!url) {
+        url = buildObjectUrl(key);
+      }
       if (!url) {
         showMessage(
           "error",
-          "请先在 NEXT_PUBLIC_OBJECT_BASE_URL 中配置可访问的对象存储地址"
+          "无法获取对象的播放地址，请检查存储配置"
         );
         return;
       }
       setPreviewObject({ key, url });
     },
-    [showMessage]
+    [showMessage, fetchObjectUrl]
   );
 
   const handleClosePreview = useCallback(() => {
