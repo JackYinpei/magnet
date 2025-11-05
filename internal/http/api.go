@@ -42,6 +42,8 @@ func NewHandler(tasks service.TaskService, manager downloader.Manager, store sto
 }
 
 func (h *Handler) RegisterRoutes(router *gin.Engine) {
+	router.Use(corsMiddleware())
+
 	api := router.Group("/api")
 	{
 		api.POST("/tasks", h.createTask)
@@ -57,6 +59,21 @@ func (h *Handler) RegisterRoutes(router *gin.Engine) {
 
 type createTaskRequest struct {
 	Magnet string `json:"magnet" binding:"required"`
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+
+		c.Next()
+	}
 }
 
 func (h *Handler) createTask(c *gin.Context) {
