@@ -51,7 +51,6 @@ func (h *Handler) RegisterRoutes(router *gin.Engine) {
 		api.GET("/tasks/:id", h.getTask)
 		api.DELETE("/tasks/:id", h.deleteTask)
 		api.GET("/storage/objects", h.listObjects)
-		api.GET("/storage/object-url", h.getObjectURL)
 		api.GET("/health", func(ctx *gin.Context) {
 			ctx.JSON(http.StatusAccepted, gin.H{"ok": "ok"})
 		})
@@ -211,40 +210,6 @@ func (h *Handler) listObjects(c *gin.Context) {
 		resp[i] = objectToResponse(objects[i])
 	}
 	c.JSON(http.StatusOK, resp)
-}
-
-func (h *Handler) getObjectURL(c *gin.Context) {
-	if h.storage == nil || h.bucket == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage service not configured"})
-		return
-	}
-
-	key := strings.TrimSpace(c.Query("key"))
-	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "object key is required"})
-		return
-	}
-
-	expiresParam := strings.TrimSpace(c.Query("expires"))
-	var expires time.Duration
-	if expiresParam == "" {
-		expires = 15 * time.Minute
-	} else {
-		seconds, err := strconv.Atoi(expiresParam)
-		if err != nil || seconds <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expires value"})
-			return
-		}
-		expires = time.Duration(seconds) * time.Second
-	}
-
-	url, err := h.storage.GetObjectURL(c.Request.Context(), h.bucket, key, expires)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"url": url})
 }
 
 type TaskResponse struct {

@@ -18,16 +18,14 @@ import (
 
 // S3Service uploads task data to Amazon S3 (or compatible APIs).
 type S3Service struct {
-	client    *s3.Client
-	uploader  *manager.Uploader
-	presigner *s3.PresignClient
+	client   *s3.Client
+	uploader *manager.Uploader
 }
 
 func NewS3Service(client *s3.Client) *S3Service {
 	return &S3Service{
-		client:    client,
-		uploader:  manager.NewUploader(client),
-		presigner: s3.NewPresignClient(client),
+		client:   client,
+		uploader: manager.NewUploader(client),
 	}
 }
 
@@ -216,37 +214,6 @@ func (s *S3Service) DeletePrefix(ctx context.Context, bucket, prefix string) err
 	}
 
 	return nil
-}
-
-func (s *S3Service) GetObjectURL(ctx context.Context, bucket, key string, expires time.Duration) (string, error) {
-	if bucket == "" {
-		return "", fmt.Errorf("storage bucket is required")
-	}
-	trimmedKey := strings.TrimSpace(strings.TrimPrefix(key, "/"))
-	if trimmedKey == "" {
-		return "", fmt.Errorf("object key is required")
-	}
-	if expires <= 0 {
-		expires = 15 * time.Minute
-	}
-	const maxExpiry = 24 * time.Hour
-	if expires > maxExpiry {
-		expires = maxExpiry
-	}
-	if s.presigner == nil {
-		return "", fmt.Errorf("s3 presign client not configured")
-	}
-
-	output, err := s.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(trimmedKey),
-	}, func(options *s3.PresignOptions) {
-		options.Expires = expires
-	})
-	if err != nil {
-		return "", fmt.Errorf("presign object: %w", err)
-	}
-	return output.URL, nil
 }
 
 var _ Service = (*S3Service)(nil)
