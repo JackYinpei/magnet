@@ -3,9 +3,12 @@ package storage
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -38,51 +41,88 @@ func (s *S3Service) UploadDirectory(ctx context.Context, localPath string, opts 
 		return "", fmt.Errorf("local path must be a directory")
 	}
 
+	type uploadFile struct {
+		path string
+		rel  string
+		size int64
+	}
+
+	var files []uploadFile
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("relative path for %s: %w", path, err)
+		}
+		files = append(files, uploadFile{
+			path: path,
+			rel:  filepath.ToSlash(rel),
+			size: info.Size(),
+		})
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	var totalSize int64
+	for _, file := range files {
+		totalSize += file.size
+	}
+
+	progress := newProgressReporter(totalSize, opts.ProgressCallback)
+	if progress != nil {
+		progress.report(0)
+	}
+
 	keyPrefix := strings.Trim(opts.KeyPrefix, "/")
 	if keyPrefix == "" {
 		keyPrefix = fmt.Sprintf("task-%d", os.Getpid())
 	}
 
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-
+	for _, file := range files {
 		key := keyPrefix
-		if rel, err := filepath.Rel(root, path); err == nil && rel != "." {
-			rel = filepath.ToSlash(rel)
+		if file.rel != "" && file.rel != "." {
 			key = strings.TrimSuffix(keyPrefix, "/")
 			if key != "" {
 				key += "/"
 			}
-			key += rel
+			key += file.rel
+		}
+		if key == "" {
+			key = filepath.ToSlash(filepath.Base(file.path))
 		}
 
-		f, err := os.Open(path)
+		f, err := os.Open(file.path)
 		if err != nil {
-			return fmt.Errorf("open file %s: %w", path, err)
+			return "", fmt.Errorf("open file %s: %w", file.path, err)
+		}
+		var reader io.Reader = f
+		if progress != nil {
+			reader = io.TeeReader(f, progress)
 		}
 		_, err = s.uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(opts.Bucket),
 			Key:    aws.String(key),
-			Body:   f,
+			Body:   reader,
 			ACL:    types.ObjectCannedACLPrivate,
 		})
 		closeErr := f.Close()
 		if err != nil {
-			return fmt.Errorf("upload %s: %w", path, err)
+			return "", fmt.Errorf("upload %s: %w", file.path, err)
 		}
 		if closeErr != nil {
-			return fmt.Errorf("close file %s: %w", path, closeErr)
+			return "", fmt.Errorf("close file %s: %w", file.path, closeErr)
 		}
+	}
 
-		return nil
-	})
-	if err != nil {
-		return "", err
+	if progress != nil {
+		progress.flush()
 	}
 
 	return fmt.Sprintf("s3://%s/%s", opts.Bucket, keyPrefix), nil
@@ -177,3 +217,52 @@ func (s *S3Service) DeletePrefix(ctx context.Context, bucket, prefix string) err
 }
 
 var _ Service = (*S3Service)(nil)
+
+type progressReporter struct {
+	total    int64
+	done     int64
+	cb       func(done, total int64)
+	mu       sync.Mutex
+	lastFire time.Time
+}
+
+func newProgressReporter(total int64, cb func(done, total int64)) *progressReporter {
+	if cb == nil {
+		return nil
+	}
+	return &progressReporter{
+		total: total,
+		cb:    cb,
+	}
+}
+
+func (p *progressReporter) Write(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.done += int64(len(b))
+	now := time.Now()
+	if now.Sub(p.lastFire) >= 200*time.Millisecond || p.done == p.total {
+		p.lastFire = now
+		p.cb(p.done, p.total)
+	}
+
+	return len(b), nil
+}
+
+func (p *progressReporter) report(done int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.done = done
+	p.lastFire = time.Now()
+	p.cb(p.done, p.total)
+}
+
+func (p *progressReporter) flush() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cb(p.done, p.total)
+}

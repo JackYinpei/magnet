@@ -20,6 +20,42 @@ const STATUS_COLORS = {
   failed: "bg-rose-100 text-rose-800",
 };
 
+const OBJECT_BASE_URL = (process.env.NEXT_PUBLIC_OBJECT_BASE_URL ?? "").replace(
+  /\/+$/,
+  ""
+);
+const OBJECT_SIGNING_QUERY =
+  process.env.NEXT_PUBLIC_OBJECT_SIGNING_QUERY ?? "";
+const VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "webm", "ogg"];
+
+function isVideoObject(key) {
+  if (!key || typeof key !== "string") return false;
+  const lastSegment = key.split("/").pop() ?? "";
+  const ext = lastSegment.split(".").pop()?.toLowerCase();
+  if (!ext) return false;
+  return VIDEO_EXTENSIONS.includes(ext);
+}
+
+function buildObjectUrl(key) {
+  if (!OBJECT_BASE_URL || !key) return "";
+  const encodedKey = key
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  let url = `${OBJECT_BASE_URL}/${encodedKey}`;
+  const signing = OBJECT_SIGNING_QUERY.trim();
+  if (signing) {
+    if (signing.startsWith("?") || signing.startsWith("&")) {
+      url += signing;
+    } else if (url.includes("?")) {
+      url += `&${signing}`;
+    } else {
+      url += `?${signing}`;
+    }
+  }
+  return url;
+}
+
 function formatBytes(bytes) {
   const value = Number(bytes ?? 0);
   if (!value || value <= 0) return "0 B";
@@ -53,6 +89,7 @@ export default function Home() {
   const [deletingTaskId, setDeletingTaskId] = useState(null);
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState("info");
+  const [previewObject, setPreviewObject] = useState(null);
 
   const apiBaseUrl = useMemo(() => resolveApiBaseUrl(), []);
 
@@ -102,6 +139,19 @@ export default function Home() {
     }, 10000);
     return () => clearInterval(id);
   }, [loadObjects, loadTasks, objectPrefix]);
+
+  useEffect(() => {
+    if (!previewObject) {
+      return undefined;
+    }
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setPreviewObject(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [previewObject]);
 
   const handleCreateTask = async (event) => {
     event.preventDefault();
@@ -168,6 +218,34 @@ export default function Home() {
     },
     [loadTasks, showMessage]
   );
+
+  const handlePreviewObject = useCallback(
+    (object) => {
+      const key = object?.key ?? "";
+      if (!key) {
+        showMessage("error", "对象 Key 无效");
+        return;
+      }
+      if (!isVideoObject(key)) {
+        showMessage("info", "当前仅支持 mp4、m4v、mov、webm、ogg 视频文件预览");
+        return;
+      }
+      const url = buildObjectUrl(key);
+      if (!url) {
+        showMessage(
+          "error",
+          "请先在 NEXT_PUBLIC_OBJECT_BASE_URL 中配置可访问的对象存储地址"
+        );
+        return;
+      }
+      setPreviewObject({ key, url });
+    },
+    [showMessage]
+  );
+
+  const handleClosePreview = useCallback(() => {
+    setPreviewObject(null);
+  }, []);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -425,41 +503,100 @@ export default function Home() {
                   <th className="px-4 py-3">Key</th>
                   <th className="w-32 px-4 py-3">大小</th>
                   <th className="w-44 px-4 py-3">最后修改时间</th>
+                  <th className="w-28 px-4 py-3">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 bg-white text-slate-700">
                 {objects.length === 0 && (
                   <tr>
                     <td
-                      colSpan={3}
+                      colSpan={4}
                       className="px-4 py-6 text-center text-slate-400"
                     >
                       暂无对象
                     </td>
                   </tr>
                 )}
-                {objects.map((object) => (
-                  <tr key={object.key}>
-                    <td className="px-4 py-3">
-                      <div className="max-w-lg truncate font-mono text-xs">
-                        {object.key}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">{formatBytes(object.size)}</td>
-                    <td className="px-4 py-3 text-xs text-slate-500">
-                      {formatDate(
-                        object.last_modified ??
-                          object.lastModified ??
-                          object.LastModified
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {objects.map((object) => {
+                  const objectUrl = buildObjectUrl(object.key);
+                  const canPreview = isVideoObject(object.key) && Boolean(objectUrl);
+                  const previewTitle = canPreview
+                    ? "播放该对象"
+                    : OBJECT_BASE_URL
+                    ? "当前仅支持常见视频格式预览"
+                    : "请配置 NEXT_PUBLIC_OBJECT_BASE_URL 后再试";
+                  return (
+                    <tr key={object.key}>
+                      <td className="px-4 py-3">
+                        <div className="max-w-lg truncate font-mono text-xs">
+                          {object.key}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">{formatBytes(object.size)}</td>
+                      <td className="px-4 py-3 text-xs text-slate-500">
+                        {formatDate(
+                          object.last_modified ??
+                            object.lastModified ??
+                            object.LastModified
+                        )}
+                      </td>
+                      <td className="px-4 py-3">
+                        <button
+                          type="button"
+                          className="text-sm font-medium text-sky-600 transition hover:text-sky-700 disabled:cursor-not-allowed disabled:text-slate-400"
+                          onClick={() => handlePreviewObject(object)}
+                          disabled={!canPreview}
+                          title={previewTitle}
+                        >
+                          播放
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         </section>
       </main>
+      {previewObject && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/70 px-4 py-6 backdrop-blur-sm"
+          onClick={handleClosePreview}
+          role="presentation"
+        >
+          <div
+            className="w-full max-w-4xl overflow-hidden rounded-xl bg-slate-950 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+            role="presentation"
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+              <div className="truncate font-mono text-xs text-slate-300">
+                {previewObject.key}
+              </div>
+              <button
+                type="button"
+                onClick={handleClosePreview}
+                className="text-xs font-medium text-slate-300 transition hover:text-white"
+              >
+                关闭
+              </button>
+            </div>
+            <div className="bg-black">
+              <video
+                key={previewObject.url}
+                src={previewObject.url}
+                controls
+                controlsList="nodownload"
+                autoPlay
+                className="h-full w-full bg-black"
+              >
+                您的浏览器不支持 HTML5 视频播放。
+              </video>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

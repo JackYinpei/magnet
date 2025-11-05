@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -262,7 +263,7 @@ func (m *manager) handleTask(ctx context.Context, handle *taskHandle, task *doma
 
 	totalLength := info.TotalLength()
 	name := info.BestName()
-	localPath := filepath.Join(m.cfg.DownloadRoot, infoHashToDir(t.InfoHash()))
+	localPath := filepath.Join(m.cfg.DownloadRoot, name)
 	task.LocalPath = localPath
 
 	if err := m.taskService.UpdateDownloadInfo(ctx, task.ID, name, localPath, totalLength); err != nil {
@@ -347,9 +348,45 @@ func (m *manager) uploadAndCleanup(ctx context.Context, task *domain.Task) {
 	if localPath == "" {
 		localPath = filepath.Join(m.cfg.DownloadRoot, fmt.Sprintf("task-%d", task.ID))
 	}
-	if _, err := os.Stat(localPath); err != nil {
-		m.failTask(ctx, task.ID, fmt.Errorf("local data missing: %w", err))
-		return
+	info, err := os.Stat(localPath)
+	if err != nil {
+		fallback := filepath.Join(m.cfg.DownloadRoot, task.TorrentName)
+		if fallback != "" && fallback != localPath {
+			if fbInfo, fbErr := os.Stat(fallback); fbErr == nil {
+				localPath = fallback
+				task.LocalPath = fallback
+				info = fbInfo
+			} else {
+				m.failTask(ctx, task.ID, fmt.Errorf("local data missing: %w", err))
+				return
+			}
+		} else {
+			m.failTask(ctx, task.ID, fmt.Errorf("local data missing: %w", err))
+			return
+		}
+	}
+
+	if !info.IsDir() {
+		stagingDir := filepath.Join(m.cfg.DownloadRoot, fmt.Sprintf("task-%d", task.ID))
+		if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+			m.failTask(ctx, task.ID, fmt.Errorf("create staging dir: %w", err))
+			return
+		}
+		dest := filepath.Join(stagingDir, filepath.Base(localPath))
+		if err := os.Rename(localPath, dest); err != nil {
+			if copyErr := copyFile(localPath, dest); copyErr != nil {
+				m.failTask(ctx, task.ID, fmt.Errorf("prepare upload data: %w", copyErr))
+				return
+			}
+			if removeErr := os.Remove(localPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				logger.Warnf("remove original file after copy: %v", removeErr)
+			}
+		}
+		localPath = stagingDir
+		task.LocalPath = stagingDir
+		if err := m.taskService.UpdateDownloadInfo(ctx, task.ID, task.TorrentName, stagingDir, task.TotalSize); err != nil {
+			logger.Warnf("refresh local path: %v", err)
+		}
 	}
 
 	opts := m.cfg.UploadOptions
@@ -360,6 +397,13 @@ func (m *manager) uploadAndCleanup(ctx context.Context, task *domain.Task) {
 	} else {
 		opts.KeyPrefix = fmt.Sprintf("%s/%s", prefix, taskPrefix)
 	}
+
+	progressLogger := newUploadProgressLogger(logger)
+	opts.ProgressCallback = func(done, total int64) {
+		progressLogger(done, total)
+	}
+
+	logger.Infof("upload started from %s", localPath)
 
 	dest, err := m.storage.UploadDirectory(ctx, localPath, opts)
 	if err != nil {
@@ -390,6 +434,77 @@ func (m *manager) failTask(ctx context.Context, taskID int64, failErr error) {
 
 func infoHashToDir(hash metainfo.Hash) string {
 	return hash.HexString()
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	defer in.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("create destination dir: %w", err)
+	}
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("create destination: %w", err)
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("copy file: %w", err)
+	}
+
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("sync destination: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close destination: %w", err)
+	}
+	return nil
+}
+
+func newUploadProgressLogger(logger *logrus.Entry) func(done, total int64) {
+	var (
+		lastLog time.Time
+	)
+	return func(done, total int64) {
+		now := time.Now()
+		if total == 0 {
+			if now.Sub(lastLog) < 500*time.Millisecond && done != 0 {
+				return
+			}
+			lastLog = now
+			logger.Infof("upload progress: %s uploaded", formatBytes(done))
+			return
+		}
+
+		percent := float64(done) / float64(total) * 100
+		if now.Sub(lastLog) < 500*time.Millisecond && done != total {
+			return
+		}
+		lastLog = now
+		logger.Infof("upload progress: %.1f%% (%s/%s)", percent, formatBytes(done), formatBytes(total))
+	}
+}
+
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB",
+		float64(b)/float64(div),
+		"KMGTPE"[exp],
+	)
 }
 
 func defaultTrackers() []string {

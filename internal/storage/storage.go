@@ -13,8 +13,9 @@ type ObjectInfo struct {
 
 // UploadOptions conveys upload destination metadata.
 type UploadOptions struct {
-	Bucket    string
-	KeyPrefix string
+	Bucket           string
+	KeyPrefix        string
+	ProgressCallback func(done, total int64)
 }
 
 // Service uploads completed downloads to remote object storage.
