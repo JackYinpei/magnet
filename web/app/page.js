@@ -27,7 +27,7 @@ const OBJECT_BASE_URL = (process.env.NEXT_PUBLIC_OBJECT_BASE_URL ?? "").replace(
 );
 const OBJECT_SIGNING_QUERY =
   process.env.NEXT_PUBLIC_OBJECT_SIGNING_QUERY ?? "";
-const VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "webm", "ogg"];
+const VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "webm", "ogg", "mkv"];
 
 function isVideoObject(key) {
   if (!key || typeof key !== "string") return false;
