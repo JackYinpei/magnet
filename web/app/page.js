@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   API_ROUTES,
   createTask,
@@ -27,6 +27,7 @@ const OBJECT_BASE_URL = (process.env.NEXT_PUBLIC_OBJECT_BASE_URL ?? "").replace(
 const OBJECT_SIGNING_QUERY =
   process.env.NEXT_PUBLIC_OBJECT_SIGNING_QUERY ?? "";
 const VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "webm", "ogg", "mkv"];
+const AUTO_REFRESH_INTERVAL = 10000;
 
 function isVideoObject(key) {
   if (!key || typeof key !== "string") return false;
@@ -90,6 +91,8 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState("info");
   const [previewObject, setPreviewObject] = useState(null);
+  const tasksRequestIdRef = useRef(0);
+  const objectsRequestIdRef = useRef(0);
 
   const apiBaseUrl = useMemo(() => resolveApiBaseUrl(), []);
 
@@ -104,41 +107,79 @@ export default function Home() {
   }, []);
 
   const loadTasks = useCallback(async () => {
+    const requestId = ++tasksRequestIdRef.current;
     setLoadingTasks(true);
     try {
       const data = await fetchTasks();
-      setTasks(Array.isArray(data) ? data : []);
+      if (tasksRequestIdRef.current === requestId) {
+        setTasks(Array.isArray(data) ? data : []);
+      }
     } catch (err) {
-      showMessage("error", err.message);
+      if (tasksRequestIdRef.current === requestId) {
+        showMessage("error", err.message);
+      }
     } finally {
-      setLoadingTasks(false);
+      if (tasksRequestIdRef.current === requestId) {
+        setLoadingTasks(false);
+      }
     }
   }, [showMessage]);
 
   const loadObjects = useCallback(
     async (prefix) => {
+      const requestId = ++objectsRequestIdRef.current;
+      const targetPrefix = prefix ?? objectPrefix;
       setLoadingObjects(true);
       try {
-        const data = await fetchObjects(prefix ?? objectPrefix);
-        setObjects(Array.isArray(data) ? data : []);
+        const data = await fetchObjects(targetPrefix);
+        if (objectsRequestIdRef.current === requestId) {
+          setObjects(Array.isArray(data) ? data : []);
+        }
       } catch (err) {
-        showMessage("error", err.message);
+        if (objectsRequestIdRef.current === requestId) {
+          showMessage("error", err.message);
+        }
       } finally {
-        setLoadingObjects(false);
+        if (objectsRequestIdRef.current === requestId) {
+          setLoadingObjects(false);
+        }
       }
     },
     [objectPrefix, showMessage]
   );
 
   useEffect(() => {
-    loadTasks();
-    loadObjects(objectPrefix);
-    const id = setInterval(() => {
-      loadTasks();
-      loadObjects(objectPrefix);
-    }, 10000);
-    return () => clearInterval(id);
-  }, [loadObjects, loadTasks, objectPrefix]);
+    if (previewObject) {
+      return undefined;
+    }
+
+    let isActive = true;
+    let timeoutId;
+
+    const refresh = async () => {
+      if (!isActive) {
+        return;
+      }
+      await Promise.all([loadTasks(), loadObjects()]);
+    };
+
+    const tick = async () => {
+      await refresh();
+      if (!isActive) {
+        return;
+      }
+      timeoutId = setTimeout(tick, AUTO_REFRESH_INTERVAL);
+    };
+
+    tick();
+
+    return () => {
+      isActive = false;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    };
+  }, [loadObjects, loadTasks, previewObject]);
 
   useEffect(() => {
     if (!previewObject) {
