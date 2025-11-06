@@ -7,6 +7,9 @@ import {
   deleteTask,
   fetchObjects,
   fetchTasks,
+  fetchCurrentUser,
+  login,
+  registerUser,
   resolveApiBaseUrl,
 } from "../lib/api";
 
@@ -28,6 +31,8 @@ const OBJECT_SIGNING_QUERY =
   process.env.NEXT_PUBLIC_OBJECT_SIGNING_QUERY ?? "";
 const VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "webm", "ogg", "mkv"];
 const AUTO_REFRESH_INTERVAL = 10000;
+const TOKEN_STORAGE_KEY = "magnet-player.auth.token";
+const USER_STORAGE_KEY = "magnet-player.auth.user";
 
 function isVideoObject(key) {
   if (!key || typeof key !== "string") return false;
@@ -80,6 +85,18 @@ function formatDate(value) {
 }
 
 export default function Home() {
+  const [authReady, setAuthReady] = useState(false);
+  const [authToken, setAuthToken] = useState("");
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authMode, setAuthMode] = useState("login");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authMessage, setAuthMessage] = useState("");
+  const [authForm, setAuthForm] = useState({
+    username: "",
+    password: "",
+    registerSecret: "",
+  });
+  const isAuthenticated = Boolean(authToken);
   const [magnet, setMagnet] = useState("");
   const [tasks, setTasks] = useState([]);
   const [objects, setObjects] = useState([]);
@@ -106,38 +123,126 @@ export default function Home() {
     return undefined;
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const storedToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+      const storedUser = window.localStorage.getItem(USER_STORAGE_KEY);
+      if (storedToken) {
+        setAuthToken(storedToken);
+      }
+      if (storedUser) {
+        try {
+          setCurrentUser(JSON.parse(storedUser));
+        } catch (err) {
+          window.localStorage.removeItem(USER_STORAGE_KEY);
+        }
+      }
+    } finally {
+      setAuthReady(true);
+    }
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    setAuthToken("");
+    setCurrentUser(null);
+    setAuthMode("login");
+    setAuthForm({ username: "", password: "", registerSecret: "" });
+    setTasks([]);
+    setObjects([]);
+    setObjectPrefix("");
+    setMagnet("");
+    setMessage("");
+    setAuthMessage("");
+    setPreviewObject(null);
+    tasksRequestIdRef.current = 0;
+    objectsRequestIdRef.current = 0;
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+      window.localStorage.removeItem(USER_STORAGE_KEY);
+    }
+  }, [setAuthForm, setAuthMode]);
+
+  useEffect(() => {
+    if (!authToken) {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const user = await fetchCurrentUser(authToken);
+        if (cancelled) {
+          return;
+        }
+        setCurrentUser(user);
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(TOKEN_STORAGE_KEY, authToken);
+          window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
+        }
+      } catch (err) {
+        if (!cancelled) {
+          handleLogout();
+          setAuthMessage("登录已过期，请重新登录");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken, handleLogout, setAuthMessage]);
+
   const loadTasks = useCallback(async () => {
+    if (!authToken) {
+      setTasks([]);
+      return;
+    }
     const requestId = ++tasksRequestIdRef.current;
     setLoadingTasks(true);
     try {
-      const data = await fetchTasks();
+      const data = await fetchTasks(authToken);
       if (tasksRequestIdRef.current === requestId) {
         setTasks(Array.isArray(data) ? data : []);
       }
     } catch (err) {
       if (tasksRequestIdRef.current === requestId) {
-        showMessage("error", err.message);
+        if (err?.status === 401) {
+          handleLogout();
+          setAuthMessage("登录已过期，请重新登录");
+        } else {
+          showMessage("error", err.message);
+        }
       }
     } finally {
       if (tasksRequestIdRef.current === requestId) {
         setLoadingTasks(false);
       }
     }
-  }, [showMessage]);
+  }, [authToken, handleLogout, setAuthMessage, showMessage]);
 
   const loadObjects = useCallback(
     async (prefix) => {
+      if (!authToken) {
+        setObjects([]);
+        return;
+      }
       const requestId = ++objectsRequestIdRef.current;
       const targetPrefix = prefix ?? objectPrefix;
       setLoadingObjects(true);
       try {
-        const data = await fetchObjects(targetPrefix);
+        const data = await fetchObjects(targetPrefix, authToken);
         if (objectsRequestIdRef.current === requestId) {
           setObjects(Array.isArray(data) ? data : []);
         }
       } catch (err) {
         if (objectsRequestIdRef.current === requestId) {
-          showMessage("error", err.message);
+          if (err?.status === 401) {
+            handleLogout();
+            setAuthMessage("登录已过期，请重新登录");
+          } else {
+            showMessage("error", err.message);
+          }
         }
       } finally {
         if (objectsRequestIdRef.current === requestId) {
@@ -145,11 +250,11 @@ export default function Home() {
         }
       }
     },
-    [objectPrefix, showMessage]
+    [authToken, handleLogout, objectPrefix, setAuthMessage, showMessage]
   );
 
   useEffect(() => {
-    if (previewObject) {
+    if (!isAuthenticated || previewObject) {
       return undefined;
     }
 
@@ -179,7 +284,7 @@ export default function Home() {
         clearTimeout(timeoutId);
       }
     };
-  }, [loadObjects, loadTasks, previewObject]);
+  }, [isAuthenticated, loadObjects, loadTasks, previewObject]);
 
   useEffect(() => {
     if (!previewObject) {
@@ -201,14 +306,23 @@ export default function Home() {
       showMessage("error", "请输入有效的 magnet 链接");
       return;
     }
+    if (!isAuthenticated) {
+      showMessage("error", "请先登录后再创建任务");
+      return;
+    }
     setCreatingTask(true);
     try {
-      const task = await createTask(value);
+      const task = await createTask(value, authToken);
       setMagnet("");
       await loadTasks();
       showMessage("success", `任务创建成功：${task.id ?? task.ID ?? "新任务"}`);
     } catch (err) {
-      showMessage("error", err.message);
+      if (err?.status === 401) {
+        handleLogout();
+        setAuthMessage("登录已过期，请重新登录");
+      } else {
+        showMessage("error", err.message);
+      }
     } finally {
       setCreatingTask(false);
     }
@@ -216,6 +330,10 @@ export default function Home() {
 
   const handleRefreshObjects = async (event) => {
     event.preventDefault();
+    if (!isAuthenticated) {
+      showMessage("error", "请先登录后再刷新对象列表");
+      return;
+    }
     await loadObjects(objectPrefix);
   };
 
@@ -224,6 +342,10 @@ export default function Home() {
       const id = task?.id ?? task?.ID;
       if (!id) {
         showMessage("error", "任务 ID 无效");
+        return;
+      }
+      if (!authToken) {
+        showMessage("error", "请先登录后再删除任务");
         return;
       }
       const confirmed = window.confirm(`确认删除任务 ${id} 吗？该操作不可撤销。`);
@@ -241,7 +363,7 @@ export default function Home() {
 
       setDeletingTaskId(id);
       try {
-        const result = await deleteTask(id, { deleteRemote });
+        const result = await deleteTask(id, { deleteRemote, token: authToken });
         if (Array.isArray(result?.warnings) && result.warnings.length > 0) {
           showMessage(
             "info",
@@ -252,12 +374,17 @@ export default function Home() {
         }
         await loadTasks();
       } catch (err) {
-        showMessage("error", err.message);
+        if (err?.status === 401) {
+          handleLogout();
+          setAuthMessage("登录已过期，请重新登录");
+        } else {
+          showMessage("error", err.message);
+        }
       } finally {
         setDeletingTaskId(null);
       }
     },
-    [loadTasks, showMessage]
+    [authToken, handleLogout, loadTasks, setAuthMessage, showMessage]
   );
 
   const handlePreviewObject = useCallback(
@@ -288,6 +415,174 @@ export default function Home() {
     setPreviewObject(null);
   }, []);
 
+  const handleAuthFieldChange = useCallback(
+    (field) => (event) => {
+      const value = event.target.value;
+      setAuthForm((prev) => ({
+        ...prev,
+        [field]: value,
+      }));
+    },
+    [setAuthForm]
+  );
+
+  const handleToggleAuthMode = useCallback(() => {
+    setAuthMode((prev) => (prev === "login" ? "register" : "login"));
+    setAuthMessage("");
+  }, [setAuthMessage, setAuthMode]);
+
+  const handleAuthSubmit = useCallback(
+    async (event) => {
+      event.preventDefault();
+      const username = authForm.username.trim();
+      const password = authForm.password.trim();
+      const registerSecret = authForm.registerSecret.trim();
+
+      if (!username || !password) {
+        setAuthMessage("请输入用户名和密码");
+        return;
+      }
+      if (authMode === "register" && !registerSecret) {
+        setAuthMessage("请输入注册密码");
+        return;
+      }
+
+      setAuthLoading(true);
+      setAuthMessage("");
+
+      try {
+        const result =
+          authMode === "login"
+            ? await login(username, password)
+            : await registerUser(username, password, registerSecret);
+
+        if (!result?.token) {
+          throw new Error("认证失败，未收到凭证");
+        }
+
+        setAuthToken(result.token);
+        setCurrentUser(result.user ?? null);
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(TOKEN_STORAGE_KEY, result.token);
+          if (result.user) {
+            window.localStorage.setItem(
+              USER_STORAGE_KEY,
+              JSON.stringify(result.user)
+            );
+          } else {
+            window.localStorage.removeItem(USER_STORAGE_KEY);
+          }
+        }
+        setAuthForm({ username: "", password: "", registerSecret: "" });
+      } catch (err) {
+        setAuthMessage(
+          err?.message ?? (authMode === "login" ? "登录失败" : "注册失败")
+        );
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authForm, authMode]
+  );
+
+  if (!authReady) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 text-slate-500">
+        正在加载配置...
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    const isRegister = authMode === "register";
+    const submitLabel = authLoading
+      ? isRegister
+        ? "注册中..."
+        : "登录中..."
+      : isRegister
+      ? "注册并登录"
+      : "登录";
+    const switchLabel = isRegister ? "已有账号？去登录" : "没有账号？立即注册";
+    const title = isRegister ? "注册 Magnet Player" : "登录 Magnet Player";
+
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4">
+        <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-8 shadow-xl">
+          <h1 className="text-2xl font-semibold text-slate-900 text-center">
+            {title}
+          </h1>
+          <p className="mt-2 text-center text-sm text-slate-500">
+            认证成功后方可访问下载控制台
+          </p>
+          <form className="mt-6 space-y-4" onSubmit={handleAuthSubmit}>
+            <div>
+              <label className="block text-sm font-medium text-slate-600">
+                用户名
+              </label>
+              <input
+                type="text"
+                className="mt-1 w-full rounded-lg border border-slate-300 px-4 py-3 text-sm text-slate-700 focus:border-sky-500 focus:outline-none focus:ring"
+                placeholder="输入用户名"
+                value={authForm.username}
+                onChange={handleAuthFieldChange("username")}
+                disabled={authLoading}
+                autoComplete="username"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-600">
+                密码
+              </label>
+              <input
+                type="password"
+                className="mt-1 w-full rounded-lg border border-slate-300 px-4 py-3 text-sm text-slate-700 focus:border-sky-500 focus:outline-none focus:ring"
+                placeholder="输入密码"
+                value={authForm.password}
+                onChange={handleAuthFieldChange("password")}
+                disabled={authLoading}
+                autoComplete={isRegister ? "new-password" : "current-password"}
+              />
+            </div>
+            {isRegister && (
+              <div>
+                <label className="block text-sm font-medium text-slate-600">
+                  注册密码
+                </label>
+                <input
+                  type="password"
+                  className="mt-1 w-full rounded-lg border border-slate-300 px-4 py-3 text-sm text-slate-700 focus:border-sky-500 focus:outline-none focus:ring"
+                  placeholder="请输入后端配置中的注册密码"
+                  value={authForm.registerSecret}
+                  onChange={handleAuthFieldChange("registerSecret")}
+                  disabled={authLoading}
+                  autoComplete="one-time-code"
+                />
+              </div>
+            )}
+            {authMessage && (
+              <p className="text-sm text-rose-600">{authMessage}</p>
+            )}
+            <button
+              type="submit"
+              className="w-full rounded-lg bg-sky-600 py-3 text-sm font-medium text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+              disabled={authLoading}
+            >
+              {submitLabel}
+            </button>
+          </form>
+          <button
+            type="button"
+            onClick={handleToggleAuthMode}
+            className="mt-4 w-full text-center text-sm font-medium text-sky-600 hover:text-sky-700"
+            disabled={authLoading}
+          >
+            {switchLabel}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <header className="border-b border-slate-200 bg-white px-6 py-4 shadow-sm">
@@ -300,11 +595,28 @@ export default function Home() {
               后端 API 基址：<span className="font-mono">{apiBaseUrl}</span>
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
-            <span className="font-mono">任务接口：{API_ROUTES.tasks}</span>
-            <span className="font-mono">
-              对象接口：{API_ROUTES.storageObjects}
-            </span>
+          <div className="flex flex-col items-start gap-3 text-xs text-slate-500 md:items-end">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="font-mono">任务接口：{API_ROUTES.tasks}</span>
+              <span className="font-mono">
+                对象接口：{API_ROUTES.storageObjects}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 text-sm text-slate-600">
+              <span>
+                当前用户：
+                <span className="font-medium text-slate-900">
+                  {currentUser?.username ?? "未知用户"}
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="rounded-lg border border-slate-300 px-3 py-1 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
+              >
+                退出登录
+              </button>
+            </div>
           </div>
         </div>
       </header>

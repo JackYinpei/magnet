@@ -29,6 +29,11 @@ type Config struct {
 	AWS struct {
 		Profile string
 	}
+	Auth struct {
+		JWTSecret        string `mapstructure:"jwt_secret"`
+		TokenTTLMinutes  int    `mapstructure:"token_ttl_minutes"`
+		RegisterPassword string `mapstructure:"register_password"`
+	}
 }
 
 // Load reads configuration from environment variables and optional config files.
@@ -48,6 +53,9 @@ func Load() (Config, error) {
 	v.SetDefault("storage.region", "us-east-1")
 	v.SetDefault("storage.endpoint", "")
 	v.SetDefault("aws.profile", "")
+	v.SetDefault("auth.jwt_secret", "")
+	v.SetDefault("auth.token_ttl_minutes", 24*60)
+	v.SetDefault("auth.register_password", "")
 
 	v.SetConfigName("config")
 	v.AddConfigPath(".")

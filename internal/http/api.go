@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 
 	"magnet-player/internal/domain"
 	"magnet-player/internal/downloader"
@@ -24,20 +25,30 @@ import (
 
 // Handler wires HTTP routes to domain services.
 type Handler struct {
-	tasks    service.TaskService
-	manager  downloader.Manager
-	storage  storage.Service
-	bucket   string
-	dataRoot string
+	tasks     service.TaskService
+	users     service.UserService
+	manager   downloader.Manager
+	storage   storage.Service
+	bucket    string
+	dataRoot  string
+	jwtSecret []byte
+	tokenTTL  time.Duration
 }
 
-func NewHandler(tasks service.TaskService, manager downloader.Manager, store storage.Service, bucket, dataRoot string) *Handler {
+func NewHandler(tasks service.TaskService, manager downloader.Manager, store storage.Service, bucket, dataRoot string, users service.UserService, jwtSecret string, tokenTTL time.Duration) *Handler {
+	secret := strings.TrimSpace(jwtSecret)
+	if tokenTTL <= 0 {
+		tokenTTL = 24 * time.Hour
+	}
 	return &Handler{
-		tasks:    tasks,
-		manager:  manager,
-		storage:  store,
-		bucket:   bucket,
-		dataRoot: dataRoot,
+		tasks:     tasks,
+		users:     users,
+		manager:   manager,
+		storage:   store,
+		bucket:    bucket,
+		dataRoot:  dataRoot,
+		jwtSecret: []byte(secret),
+		tokenTTL:  tokenTTL,
 	}
 }
 
@@ -45,21 +56,49 @@ func (h *Handler) RegisterRoutes(router *gin.Engine) {
 	router.Use(corsMiddleware())
 
 	api := router.Group("/api")
+	auth := api.Group("/auth")
 	{
-		api.POST("/tasks", h.createTask)
-		api.GET("/tasks", h.listTasks)
-		api.GET("/tasks/:id", h.getTask)
-		api.DELETE("/tasks/:id", h.deleteTask)
-		api.GET("/storage/objects", h.listObjects)
-		api.GET("/health", func(ctx *gin.Context) {
-			ctx.JSON(http.StatusAccepted, gin.H{"ok": "ok"})
-		})
+		auth.POST("/register", h.registerUser)
+		auth.POST("/login", h.loginUser)
+		auth.GET("/me", h.authMiddleware(), h.currentUser)
 	}
+
+	protected := api.Group("")
+	protected.Use(h.authMiddleware())
+	{
+		protected.POST("/tasks", h.createTask)
+		protected.GET("/tasks", h.listTasks)
+		protected.GET("/tasks/:id", h.getTask)
+		protected.DELETE("/tasks/:id", h.deleteTask)
+		protected.GET("/storage/objects", h.listObjects)
+	}
+
+	api.GET("/health", func(ctx *gin.Context) {
+		ctx.JSON(http.StatusAccepted, gin.H{"ok": "ok"})
+	})
 }
 
 type createTaskRequest struct {
 	Magnet string `json:"magnet" binding:"required"`
 }
+
+type registerRequest struct {
+	Username       string `json:"username" binding:"required"`
+	Password       string `json:"password" binding:"required"`
+	RegisterSecret string `json:"register_secret" binding:"required"`
+}
+
+type loginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+type authResponse struct {
+	Token string       `json:"token"`
+	User  UserResponse `json:"user"`
+}
+
+const contextUserKey = "authUser"
 
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -74,6 +113,178 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func (h *Handler) registerUser(c *gin.Context) {
+	if h.users == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user service not configured"})
+		return
+	}
+
+	var req registerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	user, err := h.users.Register(c.Request.Context(), req.Username, req.Password, req.RegisterSecret)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidRegistrationPassword):
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid registration password"})
+		case errors.Is(err, service.ErrUserAlreadyExists):
+			c.JSON(http.StatusConflict, gin.H{"error": "user already exists"})
+		case strings.Contains(strings.ToLower(err.Error()), "required"),
+			strings.Contains(strings.ToLower(err.Error()), "must be"):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case strings.Contains(strings.ToLower(err.Error()), "not configured"):
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "registration secret not configured"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not register user"})
+		}
+		return
+	}
+
+	token, err := h.generateToken(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, authResponse{
+		Token: token,
+		User:  userToResponse(*user),
+	})
+}
+
+func (h *Handler) loginUser(c *gin.Context) {
+	if h.users == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user service not configured"})
+		return
+	}
+
+	var req loginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	user, err := h.users.Authenticate(c.Request.Context(), req.Username, req.Password)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidCredentials) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "authentication failed"})
+		return
+	}
+
+	token, err := h.generateToken(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, authResponse{
+		Token: token,
+		User:  userToResponse(*user),
+	})
+}
+
+func (h *Handler) currentUser(c *gin.Context) {
+	user, ok := userFromContext(c)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user context missing"})
+		return
+	}
+	c.JSON(http.StatusOK, userToResponse(*user))
+}
+
+func (h *Handler) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodOptions {
+			c.Next()
+			return
+		}
+
+		authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+		if authHeader == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authorization header missing"})
+			return
+		}
+
+		parts := strings.Fields(authHeader)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization header"})
+			return
+		}
+
+		tokenString := strings.TrimSpace(parts[1])
+		if tokenString == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "token missing"})
+			return
+		}
+
+		claims := &tokenClaims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method")
+			}
+			if len(h.jwtSecret) == 0 {
+				return nil, fmt.Errorf("jwt secret not configured")
+			}
+			return h.jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+			return
+		}
+
+		if h.users == nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "user service not configured"})
+			return
+		}
+
+		user, err := h.users.GetByID(c.Request.Context(), claims.UserID)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token user"})
+			return
+		}
+
+		c.Set(contextUserKey, user)
+		c.Next()
+	}
+}
+
+func (h *Handler) generateToken(user *domain.User) (string, error) {
+	if user == nil {
+		return "", fmt.Errorf("user is required")
+	}
+	if len(h.jwtSecret) == 0 {
+		return "", fmt.Errorf("jwt secret not configured")
+	}
+
+	now := time.Now()
+	claims := tokenClaims{
+		UserID:   user.ID,
+		Username: user.Username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(h.tokenTTL)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString(h.jwtSecret)
+	if err != nil {
+		return "", fmt.Errorf("sign token: %w", err)
+	}
+	return signed, nil
+}
+
+type tokenClaims struct {
+	UserID   int64  `json:"user_id"`
+	Username string `json:"username"`
+	jwt.RegisteredClaims
 }
 
 func (h *Handler) createTask(c *gin.Context) {
@@ -210,6 +421,30 @@ func (h *Handler) listObjects(c *gin.Context) {
 		resp[i] = objectToResponse(objects[i])
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+func userFromContext(c *gin.Context) (*domain.User, bool) {
+	value, ok := c.Get(contextUserKey)
+	if !ok {
+		return nil, false
+	}
+	user, ok := value.(*domain.User)
+	if !ok || user == nil {
+		return nil, false
+	}
+	return user, true
+}
+
+type UserResponse struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+func userToResponse(user domain.User) UserResponse {
+	return UserResponse{
+		ID:       user.ID,
+		Username: user.Username,
+	}
 }
 
 type TaskResponse struct {

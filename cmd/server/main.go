@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +33,13 @@ func main() {
 		logger.Fatalf("load config: %v", err)
 	}
 
+	if strings.TrimSpace(cfg.Auth.JWTSecret) == "" {
+		logger.Fatalf("auth jwt secret is required")
+	}
+	if strings.TrimSpace(cfg.Auth.RegisterPassword) == "" {
+		logger.Fatalf("auth registration password is required")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -43,6 +51,7 @@ func main() {
 
 	taskRepo := sqlite.NewTaskRepository(db)
 	fileRepo := sqlite.NewTaskFileRepository(db)
+	userRepo := sqlite.NewUserRepository(db)
 
 	if err := taskRepo.Init(ctx); err != nil {
 		logger.Fatalf("init task repository: %v", err)
@@ -50,8 +59,12 @@ func main() {
 	if err := fileRepo.Init(ctx); err != nil {
 		logger.Fatalf("init file repository: %v", err)
 	}
+	if err := userRepo.Init(ctx); err != nil {
+		logger.Fatalf("init user repository: %v", err)
+	}
 
 	taskService := service.NewTaskService(taskRepo, fileRepo)
+	userService := service.NewUserService(userRepo, cfg.Auth.RegisterPassword)
 
 	storageSvc, err := buildStorage(ctx, cfg, logger)
 	if err != nil {
@@ -79,7 +92,16 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
-	handler := apphttp.NewHandler(taskService, manager, storageSvc, cfg.Storage.Bucket, cfg.Download.DataDir)
+	handler := apphttp.NewHandler(
+		taskService,
+		manager,
+		storageSvc,
+		cfg.Storage.Bucket,
+		cfg.Download.DataDir,
+		userService,
+		cfg.Auth.JWTSecret,
+		time.Duration(cfg.Auth.TokenTTLMinutes)*time.Minute,
+	)
 	handler.RegisterRoutes(router)
 
 	srv := &http.Server{
